@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>工作指派單路線規劃</title>
+    <title>出差里程計算明細</title>
     <!-- Tailwind CSS for styling -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Leaflet CSS & JS for Mapping -->
@@ -206,6 +206,16 @@
         let markers = [];
         let geocodeCache = {}; // 地址快取，避免重複請求
 
+        // 清理地址的共用函式：取 "(" 之前的部分並濾除樓層
+        function getCleanAddress(address) {
+            if (!address) return '';
+            // 1. 用 '(' 或 '（' 切割，只取前半段，捨棄括號後面的所有奇怪備註
+            let clean = address.split(/[\(（]/)[0];
+            // 2. 濾掉樓層或 F 等字眼
+            clean = clean.replace(/[0-9]+[Ff樓].*/, '').trim();
+            return clean;
+        }
+
         // 初始化
         window.onload = function() {
             initMap();
@@ -322,8 +332,8 @@
 
         // 使用 ArcGIS 進行更精準的地址解析
         async function geocodeAddress(address) {
-            // 清理地址，去掉可能干擾判斷的樓層等字眼 (若有括號或 "F" 或 "樓")
-            let cleanAddr = address.replace(/[\(（].*[\)）]/g, '').replace(/[0-9]+[Ff樓].*/, '').trim();
+            // 清理地址，去掉括號之後的所有字眼，以及樓層
+            let cleanAddr = getCleanAddress(address);
             
             // 先嘗試快取
             if(geocodeCache[cleanAddr]) {
@@ -423,7 +433,7 @@
                 const address = task['檢查地址'];
                 if(address) {
                     // 若沒有快取才需要延遲保護 API (ArcGIS 不嚴格，但還是稍微保護)
-                    if(!geocodeCache[address.replace(/[\(（].*[\)）]/g, '').replace(/[0-9]+[Ff樓].*/, '').trim()]) {
+                    if(!geocodeCache[getCleanAddress(address)]) {
                         await delay(300); 
                     }
                     const coords = await geocodeAddress(address);
@@ -546,9 +556,9 @@
                         distLabel.textContent = `預估總里程：${distanceKm} km`;
                         distLabel.classList.remove('hidden');
 
-                        // 計算交通費：總里程(公里)小數點無條件捨去後 乘 3.968
+                        // 計算交通費：總里程(公里)小數點無條件捨去後 乘 3.968，最後金額也無條件捨去
                         const flooredKm = Math.floor(route.distance / 1000);
-                        const fee = Math.round(flooredKm * 3.968);
+                        const fee = Math.floor(flooredKm * 3.968);
                         feeLabel.textContent = `交通費：${fee} 元`;
                         feeLabel.classList.remove('hidden');
 
