@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>工作指派單路線規劃</title>
+    <!-- Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Leaflet CSS & JS for Mapping -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!-- PapaParse for CSV parsing -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <!-- SheetJS for Excel parsing -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <style>
+        body {
+            background-color: #f3f4f6;
+            font-family: 'Microsoft JhengHei', sans-serif;
+        }
+        /* A4 列印設定 */
+        .a4-container {
+            width: 210mm;
+            min-height: 297mm;
+            background: white;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            margin: 0 auto;
+            padding: 15mm;
+            display: flex;
+            flex-direction: column;
+        }
+        #map {
+            height: 400px;
+            width: 100%;
+            z-index: 10;
+        }
+        
+        /* 列印時的樣式控制 */
+        @media print {
+            @page {
+                size: A4;
+                margin: 0;
+            }
+            body {
+                background-color: white;
+            }
+            .no-print {
+                display: none !important;
+            }
+            .a4-container {
+                box-shadow: none;
+                margin: 0;
+                padding: 10mm;
+                width: 100%;
+                height: 100%;
+            }
+            #map {
+                height: 450px; /* 列印時稍微加大地圖 */
+            }
+        }
+
+        /* 讀取動畫 */
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            vertical-align: middle;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="flex flex-col md:flex-row h-screen overflow-hidden">
+
+    <!-- 左側控制面板 (列印時隱藏) -->
+    <div class="no-print w-full md:w-1/3 lg:w-1/4 bg-white shadow-lg p-5 overflow-y-auto flex flex-col gap-5 border-r border-gray-200 z-20 relative">
+        <h2 class="text-xl font-bold text-gray-800 border-b pb-2">設定與控制面板</h2>
+
+        <!-- 地址設定區 -->
+        <div class="bg-gray-50 p-3 rounded border">
+            <h3 class="font-bold mb-2 text-sm text-gray-600">預設地點設定 (自動記憶)</h3>
+            <div class="mb-2">
+                <label class="block text-xs text-gray-500">家裡地址</label>
+                <input type="text" id="homeAddress" class="w-full text-sm border p-1 rounded" placeholder="請輸入家裡地址">
+            </div>
+            <div>
+                <label class="block text-xs text-gray-500">協會地址</label>
+                <input type="text" id="assocAddress" class="w-full text-sm border p-1 rounded" placeholder="請輸入協會地址">
+            </div>
+            <button onclick="saveAddresses()" class="mt-2 w-full bg-blue-100 text-blue-700 text-sm py-1 rounded hover:bg-blue-200 transition">儲存地址</button>
+        </div>
+
+        <!-- 檔案上傳區 -->
+        <div>
+            <h3 class="font-bold mb-2 text-sm text-gray-600">1. 上傳工作指派單 (Excel 或 CSV)</h3>
+            <input type="file" id="fileInput" accept=".csv, .xlsx, .xls" class="w-full text-sm border p-2 rounded cursor-pointer bg-gray-50">
+        </div>
+
+        <!-- 路線起訖點設定 -->
+        <div>
+            <h3 class="font-bold mb-2 text-sm text-gray-600">2. 選擇起訖點</h3>
+            <div class="flex gap-2">
+                <div class="w-1/2">
+                    <label class="block text-xs text-gray-500">出發點</label>
+                    <select id="startPoint" class="w-full text-sm border p-2 rounded">
+                        <option value="home">家裡</option>
+                        <option value="assoc">協會</option>
+                    </select>
+                </div>
+                <div class="w-1/2">
+                    <label class="block text-xs text-gray-500">結束點</label>
+                    <select id="endPoint" class="w-full text-sm border p-2 rounded">
+                        <option value="home">家裡</option>
+                        <option value="assoc">協會</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- 日期切換區 -->
+        <div>
+            <h3 class="font-bold mb-2 text-sm text-gray-600">3. 選擇工作日期</h3>
+            <select id="dateSelect" class="w-full text-sm border p-2 rounded bg-gray-50 disabled:bg-gray-200" disabled>
+                <option>請先上傳檔案...</option>
+            </select>
+        </div>
+
+        <!-- 執行按鈕 -->
+        <button id="generateBtn" onclick="generateRoute()" class="w-full bg-blue-600 text-white font-bold py-3 rounded shadow hover:bg-blue-700 transition disabled:bg-gray-400" disabled>
+            載入資料並繪製路線
+        </button>
+
+        <div id="loadingStatus" class="text-sm text-blue-600 font-bold hidden text-center">
+            <span class="loader mr-2"></span> 正在解析地址與計算路線，請稍候...
+        </div>
+
+        <hr>
+
+        <!-- 列印按鈕 -->
+        <button onclick="window.print()" class="w-full bg-green-600 text-white font-bold py-3 rounded shadow hover:bg-green-700 transition flex justify-center items-center gap-2">
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"></polyline><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path><rect x="6" y="14" width="12" height="8"></rect></svg>
+            列印本頁 (A4)
+        </button>
+    </div>
+
+    <!-- 右側 A4 預覽與列印區 -->
+    <div class="w-full md:w-2/3 lg:w-3/4 overflow-y-auto p-4 md:p-10 flex justify-center bg-gray-200">
+        <div class="a4-container relative" id="printArea">
+            
+            <div class="text-center mb-4">
+                <h1 class="text-2xl font-bold tracking-widest text-gray-800">出差里程計算明細</h1>
+                <div class="flex justify-center items-center gap-4 mt-2">
+                    <p class="text-gray-600 bg-gray-100 px-3 py-1 rounded" id="printDate">日期：未選擇</p>
+                    <p class="text-blue-700 font-bold bg-blue-50 px-3 py-1 rounded hidden" id="totalDistance">總里程：計算中...</p>
+                    <p class="text-green-700 font-bold bg-green-50 px-3 py-1 rounded hidden" id="transportFee">交通費：計算中...</p>
+                </div>
+            </div>
+
+            <!-- 地圖區塊 -->
+            <div class="border-2 border-gray-800 rounded mb-4 p-1">
+                <div id="map"></div>
+            </div>
+
+            <!-- 行程清單區塊 -->
+            <div class="flex-grow">
+                <h3 class="font-bold text-lg mb-2 border-b-2 border-gray-800 pb-1">行程明細 (依序)</h3>
+                <table class="w-full text-sm text-left border-collapse" id="scheduleTable">
+                    <thead>
+                        <tr class="bg-gray-100 border-b-2 border-gray-800">
+                            <th class="p-2 border border-gray-300 w-12 text-center">順序</th>
+                            <th class="p-2 border border-gray-300 w-24">時間</th>
+                            <th class="p-2 border border-gray-300">事業單位名稱</th>
+                            <th class="p-2 border border-gray-300">檢查地址</th>
+                        </tr>
+                    </thead>
+                    <tbody id="scheduleBody">
+                        <tr>
+                            <td colspan="4" class="p-4 text-center text-gray-500">請在左側面板上傳檔案並點擊「繪製路線」</td>
+                        </tr>
+                    </tbody>
+                </table>
+                
+                <div class="mt-2 text-xs text-gray-400 text-right">
+                    <span>圖資來源：Google Maps | 座標解析：ArcGIS</span>
+                </div>
+            </div>
+            
+            <!-- 申請人簽章區塊 -->
+            <div class="mt-12 mb-4 pr-8 text-right text-lg font-bold text-gray-800">
+                申 請 人： ________________________
+            </div>
+
+        </div>
+    </div>
+
+    <script>
+        // 系統變數
+        let parsedData = [];
+        let groupedData = {};
+        let map;
+        let routeLayer;
+        let markers = [];
+        let geocodeCache = {}; // 地址快取，避免重複請求
+
+        // 初始化
+        window.onload = function() {
+            initMap();
+            loadSavedAddresses();
+            
+            // 綁定檔案上傳事件
+            document.getElementById('fileInput').addEventListener('change', handleFileUpload);
+        };
+
+        // 讀取/儲存地址 (LocalStorage)
+        function loadSavedAddresses() {
+            if(localStorage.getItem('homeAddress')) {
+                document.getElementById('homeAddress').value = localStorage.getItem('homeAddress');
+            }
+            if(localStorage.getItem('assocAddress')) {
+                document.getElementById('assocAddress').value = localStorage.getItem('assocAddress');
+            }
+        }
+
+        function saveAddresses() {
+            const home = document.getElementById('homeAddress').value;
+            const assoc = document.getElementById('assocAddress').value;
+            localStorage.setItem('homeAddress', home);
+            localStorage.setItem('assocAddress', assoc);
+            alert('預設地址已成功儲存！');
+        }
+
+        // 初始化地圖
+        function initMap() {
+            // 預設中心點: 台灣
+            map = L.map('map').setView([23.6978, 120.9605], 7);
+            
+            // 將底圖替換為 Google Maps 街道圖 (帶有繁體中文 hl=zh-TW)
+            L.tileLayer('https://mt1.google.com/vt/lyrs=m&hl=zh-TW&x={x}&y={y}&z={z}', {
+                maxZoom: 20,
+                attribution: '&copy; Google Maps'
+            }).addTo(map);
+        }
+
+        // 處理檔案上傳
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const fileExt = file.name.split('.').pop().toLowerCase();
+
+            if (fileExt === 'csv') {
+                Papa.parse(file, {
+                    header: true,
+                    skipEmptyLines: true,
+                    complete: function(results) {
+                        parsedData = results.data;
+                        processDates();
+                    },
+                    error: function(err) {
+                        alert("CSV檔案讀取失敗，請確認格式。");
+                    }
+                });
+            } else if (fileExt === 'xlsx' || fileExt === 'xls') {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    try {
+                        const data = new Uint8Array(e.target.result);
+                        const workbook = XLSX.read(data, {type: 'array'});
+                        const firstSheetName = workbook.SheetNames[0];
+                        const worksheet = workbook.Sheets[firstSheetName];
+                        
+                        parsedData = XLSX.utils.sheet_to_json(worksheet, { raw: false, defval: "" });
+                        processDates();
+                    } catch (error) {
+                        console.error(error);
+                        alert("Excel 檔案解析失敗，請確認檔案是否損壞。");
+                    }
+                };
+                reader.readAsArrayBuffer(file);
+            } else {
+                alert("不支援的檔案格式，請上傳 Excel 或 CSV 檔案。");
+            }
+        }
+
+        // 整理日期
+        function processDates() {
+            groupedData = {};
+            const dateSelect = document.getElementById('dateSelect');
+            dateSelect.innerHTML = '';
+
+            parsedData.forEach(row => {
+                const dateTimeStr = row['檢查日期時間'];
+                if(dateTimeStr) {
+                    const datePart = dateTimeStr.split(' ')[0];
+                    if(!groupedData[datePart]) {
+                        groupedData[datePart] = [];
+                    }
+                    groupedData[datePart].push(row);
+                }
+            });
+
+            const dates = Object.keys(groupedData).sort();
+            if(dates.length === 0) {
+                dateSelect.innerHTML = '<option>找不到日期資料</option>';
+                return;
+            }
+
+            dates.forEach(date => {
+                const option = document.createElement('option');
+                option.value = date;
+                option.textContent = date + ` (${groupedData[date].length} 筆)`;
+                dateSelect.appendChild(option);
+            });
+
+            dateSelect.disabled = false;
+            document.getElementById('generateBtn').disabled = false;
+        }
+
+        // 使用 ArcGIS 進行更精準的地址解析
+        async function geocodeAddress(address) {
+            // 清理地址，去掉可能干擾判斷的樓層等字眼 (若有括號或 "F" 或 "樓")
+            let cleanAddr = address.replace(/[\(（].*[\)）]/g, '').replace(/[0-9]+[Ff樓].*/, '').trim();
+            
+            // 先嘗試快取
+            if(geocodeCache[cleanAddr]) {
+                return geocodeCache[cleanAddr];
+            }
+
+            // 使用 ArcGIS 服務 (對台灣地址極度友善且免金鑰)
+            const url = `https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine=${encodeURIComponent(cleanAddr)}&maxLocations=1`;
+            
+            try {
+                const response = await fetch(url);
+                const data = await response.json();
+                if (data && data.candidates && data.candidates.length > 0) {
+                    const coords = [data.candidates[0].location.y, data.candidates[0].location.x];
+                    geocodeCache[cleanAddr] = coords; // 存入快取
+                    return coords;
+                }
+            } catch (error) {
+                console.error("ArcGIS Geocoding error:", error);
+            }
+
+            // 若 ArcGIS 失敗，備用方案 Nominatim
+            const fallbackUrl = `https://nominatim.openstreetmap.org/search?format=json&q=台灣 ${encodeURIComponent(cleanAddr)}&limit=1`;
+            try {
+                const response = await fetch(fallbackUrl);
+                const data = await response.json();
+                if (data && data.length > 0) {
+                    const coords = [parseFloat(data[0].lat), parseFloat(data[0].lon)];
+                    geocodeCache[cleanAddr] = coords; // 存入快取
+                    return coords;
+                }
+            } catch (error) {
+                console.error("Nominatim Geocoding error:", error);
+            }
+
+            return null; // 還是找不到
+        }
+
+        // 延遲函數
+        const delay = ms => new Promise(res => setTimeout(res, ms));
+
+        // 主要產生路線流程
+        async function generateRoute() {
+            const dateSelect = document.getElementById('dateSelect').value;
+            const startType = document.getElementById('startPoint').value;
+            const endType = document.getElementById('endPoint').value;
+            const homeAddr = document.getElementById('homeAddress').value;
+            const assocAddr = document.getElementById('assocAddress').value;
+
+            if(!dateSelect) return alert("請先選擇日期");
+
+            const tasks = groupedData[dateSelect];
+            tasks.sort((a, b) => (a['檢查日期時間'] || '').localeCompare(b['檢查日期時間'] || ''));
+
+            // 合併相同事業單位與地址 (連續相同的合併為一筆)
+            let mergedTasks = [];
+            tasks.forEach(task => {
+                const lastTask = mergedTasks[mergedTasks.length - 1];
+                if (lastTask && 
+                    lastTask['事業單位名稱'] === task['事業單位名稱'] && 
+                    lastTask['檢查地址'] === task['檢查地址']) {
+                    // 重複的行程，跳過不處理
+                } else {
+                    mergedTasks.push(task);
+                }
+            });
+
+            // UI 更新
+            document.getElementById('generateBtn').classList.add('hidden');
+            document.getElementById('loadingStatus').classList.remove('hidden');
+            document.getElementById('printDate').textContent = `日期：${dateSelect}`;
+            document.getElementById('totalDistance').classList.add('hidden'); // 先隱藏里程
+            document.getElementById('transportFee').classList.add('hidden'); // 先隱藏交通費
+
+            let waypoints = [];
+            let missingAddresses = [];
+
+            // 1. 處理起點
+            const startAddrStr = startType === 'home' ? homeAddr : assocAddr;
+            const startName = startType === 'home' ? '家裡 (起點)' : '協會 (起點)';
+            if(startAddrStr) {
+                const coords = await geocodeAddress(startAddrStr);
+                if(coords) {
+                    waypoints.push({ name: startName, address: startAddrStr, latlng: coords, type: 'start' });
+                } else {
+                    alert(`無法解析起點地址：${startAddrStr}，請檢查是否輸入正確`);
+                    resetUI(); return;
+                }
+            } else {
+                alert(`請先在設定區輸入${startName}的地址`);
+                resetUI(); return;
+            }
+
+            // 2. 處理任務點
+            for (let i = 0; i < mergedTasks.length; i++) {
+                const task = mergedTasks[i];
+                const address = task['檢查地址'];
+                if(address) {
+                    // 若沒有快取才需要延遲保護 API (ArcGIS 不嚴格，但還是稍微保護)
+                    if(!geocodeCache[address.replace(/[\(（].*[\)）]/g, '').replace(/[0-9]+[Ff樓].*/, '').trim()]) {
+                        await delay(300); 
+                    }
+                    const coords = await geocodeAddress(address);
+                    if(coords) {
+                        waypoints.push({
+                            name: `任務 ${i+1}`,
+                            address: address,
+                            latlng: coords,
+                            type: 'task',
+                            time: task['檢查日期時間'].split(' ')[1] || '',
+                            unit: task['事業單位名稱']
+                        });
+                    } else {
+                        missingAddresses.push(`${task['事業單位名稱']} (${address})`);
+                        waypoints.push({
+                            name: `任務 ${i+1} (未定位)`,
+                            address: address,
+                            latlng: null,
+                            type: 'task',
+                            time: task['檢查日期時間'].split(' ')[1] || '',
+                            unit: task['事業單位名稱']
+                        });
+                    }
+                }
+            }
+
+            // 3. 處理終點
+            const endAddrStr = endType === 'home' ? homeAddr : assocAddr;
+            const endName = endType === 'home' ? '家裡 (終點)' : '協會 (終點)';
+            if(endAddrStr) {
+                const coords = await geocodeAddress(endAddrStr);
+                if(coords) {
+                    waypoints.push({ name: endName, address: endAddrStr, latlng: coords, type: 'end' });
+                }
+            }
+
+            if(missingAddresses.length > 0) {
+                alert(`注意：以下地址格式無法解析定位，但仍會顯示在清單中：\n\n${missingAddresses.join('\n')}`);
+            }
+
+            // 繪製地圖與表格
+            drawMap(waypoints);
+            buildTable(waypoints);
+            resetUI();
+        }
+
+        function resetUI() {
+            document.getElementById('generateBtn').classList.remove('hidden');
+            document.getElementById('loadingStatus').classList.add('hidden');
+        }
+
+        function drawMap(waypoints) {
+            // 清除舊圖層
+            if (routeLayer) map.removeLayer(routeLayer);
+            markers.forEach(m => map.removeLayer(m));
+            markers = [];
+
+            const validPoints = waypoints.filter(wp => wp.latlng !== null);
+            const distLabel = document.getElementById('totalDistance');
+            const feeLabel = document.getElementById('transportFee');
+            
+            if(validPoints.length === 0) {
+                distLabel.textContent = "總里程：無法計算";
+                distLabel.classList.remove('hidden');
+                feeLabel.classList.add('hidden');
+                return;
+            }
+
+            // 畫標記
+            const latlngs = [];
+            validPoints.forEach((wp, index) => {
+                latlngs.push(wp.latlng);
+                
+                let iconColor = wp.type === 'task' ? 'blue' : (wp.type === 'start' ? '#10b981' : '#ef4444');
+                let popupText = `<b>${wp.name}</b><br>${wp.address}`;
+                if(wp.unit) popupText += `<br>${wp.unit}`;
+
+                // 若剛好同地址重疊，使用 offset (簡單避開)
+                const offsetLatlng = [wp.latlng[0] + (Math.random()*0.0002 - 0.0001), wp.latlng[1] + (Math.random()*0.0002 - 0.0001)];
+
+                const markerHtml = `<div style="background-color:${iconColor}; width: 24px; height: 24px; border-radius: 50%; border: 2px solid white; color: white; text-align: center; line-height: 20px; font-weight: bold; box-shadow: 0 0 4px rgba(0,0,0,0.5); font-size: 12px;">${wp.type === 'task' ? index : (wp.type==='start'?'起':'終')}</div>`;
+                
+                const customIcon = L.divIcon({
+                    html: markerHtml,
+                    className: '',
+                    iconSize: [24, 24],
+                    iconAnchor: [12, 12]
+                });
+
+                const marker = L.marker(offsetLatlng, {icon: customIcon})
+                    .bindPopup(popupText)
+                    .addTo(map);
+                markers.push(marker);
+            });
+
+            // 調整地圖視野
+            map.fitBounds(L.latLngBounds(latlngs), { padding: [30, 30] });
+
+            if(latlngs.length < 2) {
+                distLabel.textContent = "總里程：0.0 公里";
+                distLabel.classList.remove('hidden');
+                feeLabel.textContent = "交通費：0 元";
+                feeLabel.classList.remove('hidden');
+                return;
+            }
+
+            // 繪製連線並取得總距離 (使用 OSRM)
+            const coordsString = latlngs.map(ll => `${ll[1]},${ll[0]}`).join(';');
+            const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${coordsString}?overview=full&geometries=geojson`;
+
+            fetch(osrmUrl)
+                .then(res => res.json())
+                .then(data => {
+                    if(data.routes && data.routes.length > 0) {
+                        const route = data.routes[0];
+                        const geojsonRoute = route.geometry;
+                        
+                        // OSRM 回傳的 distance 單位為「公尺」，除以 1000 轉換為公里，小數點取到第一位
+                        const distanceKm = (route.distance / 1000).toFixed(1);
+                        distLabel.textContent = `預估總里程：${distanceKm} km`;
+                        distLabel.classList.remove('hidden');
+
+                        // 計算交通費：總里程(公里)小數點無條件捨去後 乘 3.968
+                        const flooredKm = Math.floor(route.distance / 1000);
+                        const fee = Math.round(flooredKm * 3.968);
+                        feeLabel.textContent = `交通費：${fee} 元`;
+                        feeLabel.classList.remove('hidden');
+
+                        routeLayer = L.geoJSON(geojsonRoute, {
+                            style: { color: '#3b82f6', weight: 5, opacity: 0.8 }
+                        }).addTo(map);
+                    } else {
+                        throw new Error("No routes found");
+                    }
+                })
+                .catch(err => {
+                    console.error("OSRM Route Error:", err);
+                    distLabel.textContent = `預估總里程：無法計算 (路徑規劃失敗)`;
+                    distLabel.classList.remove('hidden');
+                    feeLabel.classList.add('hidden');
+                    // 若 OSRM 失敗，畫直線 fallback
+                    routeLayer = L.polyline(latlngs, {color: 'gray', dashArray: '5, 5'}).addTo(map);
+                });
+        }
+
+        function buildTable(waypoints) {
+            const tbody = document.getElementById('scheduleBody');
+            tbody.innerHTML = '';
+
+            waypoints.forEach((wp, index) => {
+                const tr = document.createElement('tr');
+                tr.className = wp.type !== 'task' ? 'bg-gray-50 font-bold' : '';
+                
+                let orderText = wp.type === 'start' ? '起點' : (wp.type === 'end' ? '終點' : index);
+                
+                tr.innerHTML = `
+                    <td class="p-2 border border-gray-300 text-center">${orderText}</td>
+                    <td class="p-2 border border-gray-300">${wp.time || '-'}</td>
+                    <td class="p-2 border border-gray-300">${wp.unit || wp.name}</td>
+                    <td class="p-2 border border-gray-300">${wp.address} ${wp.latlng === null ? '<br><span class="text-red-500 text-xs">(地址無法解析定位)</span>' : ''}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+    </script>
+</body>
+</html>
