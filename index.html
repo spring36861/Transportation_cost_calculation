@@ -213,16 +213,23 @@
         let markers = [];
         let geocodeCache = {}; // 地址快取，避免重複請求
 
-        // 清理地址的共用函式：包含處理「交叉路口」與括號
-        function getCleanAddress(address) {
-            if (!address) return '';
-            // 1. 用 '(' 或 '（' 切割，只取前半段，捨棄括號後面的所有奇怪備註
+        // 延遲函數 (保護 API 用)
+        const delay = ms => new Promise(res => setTimeout(res, ms));
+
+        // =========================================================================
+        // 核心 SKILL：台灣特殊地址清理與智慧變體產生器
+        // 專門應付台灣地址常見的備註、樓層、交叉路口、以及連字號(-1號)等複雜情況
+        // =========================================================================
+        function getSmartAddressVariants(address) {
+            if (!address) return [];
+            
+            // 1. 捨棄括號與其後的備註
             let clean = String(address).split(/[\(（]/)[0];
             
-            // 2. 濾掉樓層或 F 等字眼
+            // 2. 濾除樓層干擾 (如 3F, 3樓)
             clean = clean.replace(/[0-9]+[Ff樓].*/, '');
 
-            // 3. 處理「交叉路口」的特別語法 (例如: XX路與YY路交叉口 -> XX路 & YY路)
+            // 3. 處理「交叉路口」特殊語法 (轉為 ArcGIS 看得懂的 &)
             if (clean.includes('交叉') || clean.includes('路口')) {
                 clean = clean.replace(/交叉路口/g, '')
                              .replace(/交叉口/g, '')
@@ -232,7 +239,18 @@
                              .replace(/及/g, ' & ');
             }
             
-            return clean.trim();
+            clean = clean.trim();
+
+            // 4. 產生多種變體以應付不同的圖資庫標準 (由最精確到最寬鬆)
+            let variants = [
+                clean,
+                clean.replace(/-(\d+)/g, '之$1'), // 變體 1: -1號 -> 之1號
+                clean.replace(/-\d+/g, ''),      // 變體 2: 拔除附屬號 (只找主建號)
+                clean.replace(/(號).*/, '$1')    // 變體 3: 拔除「號」之後的所有贅字
+            ];
+            
+            // 移除重複的變體陣列並回傳
+            return [...new Set(variants)];
         }
 
         // 初始化
@@ -364,26 +382,19 @@
             document.getElementById('generateBtn').disabled = false;
         }
 
-        // 使用 ArcGIS 進行更精準的地址解析
+        // 使用 SKILL 解析地址並請求經緯度
         async function geocodeAddress(address) {
-            // 取得已清理並翻譯過交叉路口的地址
-            let cleanAddr = getCleanAddress(address);
+            // 取得智慧解析後的所有可能地址變體
+            let variants = getSmartAddressVariants(address);
+            if (variants.length === 0) return null;
+            
+            // 使用變體的第一項 (最原始清理版本) 當作快取的 Key
+            let cacheKey = variants[0];
             
             // 先嘗試快取
-            if(geocodeCache[cleanAddr]) {
-                return geocodeCache[cleanAddr];
+            if(geocodeCache[cacheKey]) {
+                return geocodeCache[cacheKey];
             }
-
-            // 產生多種地址變體，大幅提升台灣地址命中率 (解決類似 216-1號 找不到的問題)
-            let variants = [
-                cleanAddr,
-                cleanAddr.replace(/-(\d+)/g, '之$1'), // 變體 1: 216-1號 -> 216之1號
-                cleanAddr.replace(/-\d+/g, ''),      // 變體 2: 216-1號 -> 216號 (只找主號)
-                cleanAddr.replace(/(號).*/, '$1')    // 變體 3: 拔除號之後的文字 (例如: XX號工業區 -> XX號)
-            ];
-            
-            // 移除重複的搜尋條件
-            variants = [...new Set(variants)];
 
             for (let variant of variants) {
                 // 使用 ArcGIS 服務
@@ -394,12 +405,15 @@
                     const data = await response.json();
                     if (data && data.candidates && data.candidates.length > 0) {
                         const coords = [data.candidates[0].location.y, data.candidates[0].location.x];
-                        geocodeCache[cleanAddr] = coords; // 存入快取
+                        geocodeCache[cacheKey] = coords; // 存入快取
                         return coords;
                     }
                 } catch (error) {
                     console.error("ArcGIS Geocoding error:", error);
                 }
+
+                // 保護免費的 Nominatim API，稍微延遲避免被封鎖
+                await delay(300);
 
                 // 若 ArcGIS 失敗，備用方案 Nominatim
                 const fallbackUrl = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent('台灣 ' + variant)}&limit=1`;
@@ -408,7 +422,7 @@
                     const data = await response.json();
                     if (data && data.length > 0) {
                         const coords = [parseFloat(data[0].lat), parseFloat(data[0].lon)];
-                        geocodeCache[cleanAddr] = coords; // 存入快取
+                        geocodeCache[cacheKey] = coords; // 存入快取
                         return coords;
                     }
                 } catch (error) {
@@ -418,9 +432,6 @@
 
             return null; // 所有變體都找不到
         }
-
-        // 延遲函數
-        const delay = ms => new Promise(res => setTimeout(res, ms));
 
         // 主要產生路線流程
         async function generateRoute() {
@@ -621,9 +632,9 @@
                         distLabel.textContent = `預估總里程：${distanceKm} km`;
                         distLabel.classList.remove('hidden');
 
-                        // 計算交通費：總里程(公里)小數點無條件捨去後 乘 3.968
-                        const flooredKm = Math.floor(route.distance / 1000);
-                        const fee = Math.round(flooredKm * 3.968);
+                        // 計算交通費：總里程(公里)直接乘 3.968，最後金額小數點無條件捨去
+                        const rawKm = route.distance / 1000;
+                        const fee = Math.floor(rawKm * 3.968);
                         feeLabel.textContent = `交通費：${fee} 元`;
                         feeLabel.classList.remove('hidden');
 
