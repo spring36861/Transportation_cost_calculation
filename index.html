@@ -58,6 +58,11 @@
             #map {
                 height: 450px; /* 列印時稍微加大地圖 */
             }
+            /* 強制列印背景顏色與圖片，確保地圖正常顯示 */
+            * {
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
         }
 
         /* 讀取動畫 */
@@ -107,14 +112,16 @@
                 <div class="w-1/2">
                     <label class="block text-xs text-gray-500">出發點</label>
                     <select id="startPoint" class="w-full text-sm border p-2 rounded">
-                        <option value="home">家裡</option>
+                        <option value="none">不設定起點</option>
+                        <option value="home" selected>家裡</option>
                         <option value="assoc">協會</option>
                     </select>
                 </div>
                 <div class="w-1/2">
                     <label class="block text-xs text-gray-500">結束點</label>
                     <select id="endPoint" class="w-full text-sm border p-2 rounded">
-                        <option value="home">家裡</option>
+                        <option value="none">不設定終點</option>
+                        <option value="home" selected>家裡</option>
                         <option value="assoc">協會</option>
                     </select>
                 </div>
@@ -206,14 +213,26 @@
         let markers = [];
         let geocodeCache = {}; // 地址快取，避免重複請求
 
-        // 清理地址的共用函式：取 "(" 之前的部分並濾除樓層
+        // 清理地址的共用函式：包含處理「交叉路口」與括號
         function getCleanAddress(address) {
             if (!address) return '';
             // 1. 用 '(' 或 '（' 切割，只取前半段，捨棄括號後面的所有奇怪備註
-            let clean = address.split(/[\(（]/)[0];
+            let clean = String(address).split(/[\(（]/)[0];
+            
             // 2. 濾掉樓層或 F 等字眼
-            clean = clean.replace(/[0-9]+[Ff樓].*/, '').trim();
-            return clean;
+            clean = clean.replace(/[0-9]+[Ff樓].*/, '');
+
+            // 3. 處理「交叉路口」的特別語法 (例如: XX路與YY路交叉口 -> XX路 & YY路)
+            if (clean.includes('交叉') || clean.includes('路口')) {
+                clean = clean.replace(/交叉路口/g, '')
+                             .replace(/交叉口/g, '')
+                             .replace(/路口/g, '')
+                             .replace(/與/g, ' & ')
+                             .replace(/和/g, ' & ')
+                             .replace(/及/g, ' & ');
+            }
+            
+            return clean.trim();
         }
 
         // 初始化
@@ -262,12 +281,23 @@
 
             const fileExt = file.name.split('.').pop().toLowerCase();
 
+            // 用來清理資料的輔助函式 (去除標題與內容的隱藏多餘空白)
+            const cleanData = (data) => {
+                return data.map(row => {
+                    let newRow = {};
+                    for (let key in row) {
+                        newRow[key.trim()] = typeof row[key] === 'string' ? row[key].trim() : row[key];
+                    }
+                    return newRow;
+                });
+            };
+
             if (fileExt === 'csv') {
                 Papa.parse(file, {
                     header: true,
                     skipEmptyLines: true,
                     complete: function(results) {
-                        parsedData = results.data;
+                        parsedData = cleanData(results.data);
                         processDates();
                     },
                     error: function(err) {
@@ -283,7 +313,8 @@
                         const firstSheetName = workbook.SheetNames[0];
                         const worksheet = workbook.Sheets[firstSheetName];
                         
-                        parsedData = XLSX.utils.sheet_to_json(worksheet, { raw: false, defval: "" });
+                        let rawData = XLSX.utils.sheet_to_json(worksheet, { raw: false, defval: "" });
+                        parsedData = cleanData(rawData);
                         processDates();
                     } catch (error) {
                         console.error(error);
@@ -303,9 +334,12 @@
             dateSelect.innerHTML = '';
 
             parsedData.forEach(row => {
-                const dateTimeStr = row['檢查日期時間'];
-                if(dateTimeStr) {
-                    const datePart = dateTimeStr.split(' ')[0];
+                // 安全讀取日期欄位
+                const dateTimeRaw = row['檢查日期時間'];
+                if(dateTimeRaw) {
+                    const dateTimeStr = String(dateTimeRaw).trim();
+                    const datePart = dateTimeStr.split(/[ T]/)[0]; // 用空白或T分割
+                    
                     if(!groupedData[datePart]) {
                         groupedData[datePart] = [];
                     }
@@ -332,7 +366,7 @@
 
         // 使用 ArcGIS 進行更精準的地址解析
         async function geocodeAddress(address) {
-            // 清理地址，去掉括號之後的所有字眼，以及樓層
+            // 取得已清理並翻譯過交叉路口的地址
             let cleanAddr = getCleanAddress(address);
             
             // 先嘗試快取
@@ -340,36 +374,49 @@
                 return geocodeCache[cleanAddr];
             }
 
-            // 使用 ArcGIS 服務 (對台灣地址極度友善且免金鑰)
-            const url = `https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine=${encodeURIComponent(cleanAddr)}&maxLocations=1`;
+            // 產生多種地址變體，大幅提升台灣地址命中率 (解決類似 216-1號 找不到的問題)
+            let variants = [
+                cleanAddr,
+                cleanAddr.replace(/-(\d+)/g, '之$1'), // 變體 1: 216-1號 -> 216之1號
+                cleanAddr.replace(/-\d+/g, ''),      // 變體 2: 216-1號 -> 216號 (只找主號)
+                cleanAddr.replace(/(號).*/, '$1')    // 變體 3: 拔除號之後的文字 (例如: XX號工業區 -> XX號)
+            ];
             
-            try {
-                const response = await fetch(url);
-                const data = await response.json();
-                if (data && data.candidates && data.candidates.length > 0) {
-                    const coords = [data.candidates[0].location.y, data.candidates[0].location.x];
-                    geocodeCache[cleanAddr] = coords; // 存入快取
-                    return coords;
+            // 移除重複的搜尋條件
+            variants = [...new Set(variants)];
+
+            for (let variant of variants) {
+                // 使用 ArcGIS 服務
+                const url = `https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine=${encodeURIComponent('台灣 ' + variant)}&maxLocations=1`;
+                
+                try {
+                    const response = await fetch(url);
+                    const data = await response.json();
+                    if (data && data.candidates && data.candidates.length > 0) {
+                        const coords = [data.candidates[0].location.y, data.candidates[0].location.x];
+                        geocodeCache[cleanAddr] = coords; // 存入快取
+                        return coords;
+                    }
+                } catch (error) {
+                    console.error("ArcGIS Geocoding error:", error);
                 }
-            } catch (error) {
-                console.error("ArcGIS Geocoding error:", error);
+
+                // 若 ArcGIS 失敗，備用方案 Nominatim
+                const fallbackUrl = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent('台灣 ' + variant)}&limit=1`;
+                try {
+                    const response = await fetch(fallbackUrl);
+                    const data = await response.json();
+                    if (data && data.length > 0) {
+                        const coords = [parseFloat(data[0].lat), parseFloat(data[0].lon)];
+                        geocodeCache[cleanAddr] = coords; // 存入快取
+                        return coords;
+                    }
+                } catch (error) {
+                    console.error("Nominatim Geocoding error:", error);
+                }
             }
 
-            // 若 ArcGIS 失敗，備用方案 Nominatim
-            const fallbackUrl = `https://nominatim.openstreetmap.org/search?format=json&q=台灣 ${encodeURIComponent(cleanAddr)}&limit=1`;
-            try {
-                const response = await fetch(fallbackUrl);
-                const data = await response.json();
-                if (data && data.length > 0) {
-                    const coords = [parseFloat(data[0].lat), parseFloat(data[0].lon)];
-                    geocodeCache[cleanAddr] = coords; // 存入快取
-                    return coords;
-                }
-            } catch (error) {
-                console.error("Nominatim Geocoding error:", error);
-            }
-
-            return null; // 還是找不到
+            return null; // 所有變體都找不到
         }
 
         // 延遲函數
@@ -377,107 +424,125 @@
 
         // 主要產生路線流程
         async function generateRoute() {
-            const dateSelect = document.getElementById('dateSelect').value;
-            const startType = document.getElementById('startPoint').value;
-            const endType = document.getElementById('endPoint').value;
-            const homeAddr = document.getElementById('homeAddress').value;
-            const assocAddr = document.getElementById('assocAddress').value;
+            try {
+                const dateSelect = document.getElementById('dateSelect').value;
+                const startType = document.getElementById('startPoint').value;
+                const endType = document.getElementById('endPoint').value;
+                const homeAddr = document.getElementById('homeAddress').value;
+                const assocAddr = document.getElementById('assocAddress').value;
 
-            if(!dateSelect) return alert("請先選擇日期");
+                if(!dateSelect) return alert("請先選擇日期");
 
-            const tasks = groupedData[dateSelect];
-            tasks.sort((a, b) => (a['檢查日期時間'] || '').localeCompare(b['檢查日期時間'] || ''));
+                const tasks = groupedData[dateSelect];
+                tasks.sort((a, b) => (String(a['檢查日期時間'] || '')).localeCompare(String(b['檢查日期時間'] || '')));
 
-            // 合併相同事業單位與地址 (連續相同的合併為一筆)
-            let mergedTasks = [];
-            tasks.forEach(task => {
-                const lastTask = mergedTasks[mergedTasks.length - 1];
-                if (lastTask && 
-                    lastTask['事業單位名稱'] === task['事業單位名稱'] && 
-                    lastTask['檢查地址'] === task['檢查地址']) {
-                    // 重複的行程，跳過不處理
-                } else {
-                    mergedTasks.push(task);
-                }
-            });
+                // 合併相同事業單位與地址 (連續相同的合併為一筆)
+                let mergedTasks = [];
+                tasks.forEach(task => {
+                    const lastTask = mergedTasks[mergedTasks.length - 1];
+                    const unitA = String(lastTask ? lastTask['事業單位名稱'] || '' : '').trim();
+                    const unitB = String(task['事業單位名稱'] || '').trim();
+                    const addrA = String(lastTask ? lastTask['檢查地址'] || '' : '').trim();
+                    const addrB = String(task['檢查地址'] || '').trim();
 
-            // UI 更新
-            document.getElementById('generateBtn').classList.add('hidden');
-            document.getElementById('loadingStatus').classList.remove('hidden');
-            document.getElementById('printDate').textContent = `日期：${dateSelect}`;
-            document.getElementById('totalDistance').classList.add('hidden'); // 先隱藏里程
-            document.getElementById('transportFee').classList.add('hidden'); // 先隱藏交通費
-
-            let waypoints = [];
-            let missingAddresses = [];
-
-            // 1. 處理起點
-            const startAddrStr = startType === 'home' ? homeAddr : assocAddr;
-            const startName = startType === 'home' ? '家裡 (起點)' : '協會 (起點)';
-            if(startAddrStr) {
-                const coords = await geocodeAddress(startAddrStr);
-                if(coords) {
-                    waypoints.push({ name: startName, address: startAddrStr, latlng: coords, type: 'start' });
-                } else {
-                    alert(`無法解析起點地址：${startAddrStr}，請檢查是否輸入正確`);
-                    resetUI(); return;
-                }
-            } else {
-                alert(`請先在設定區輸入${startName}的地址`);
-                resetUI(); return;
-            }
-
-            // 2. 處理任務點
-            for (let i = 0; i < mergedTasks.length; i++) {
-                const task = mergedTasks[i];
-                const address = task['檢查地址'];
-                if(address) {
-                    // 若沒有快取才需要延遲保護 API (ArcGIS 不嚴格，但還是稍微保護)
-                    if(!geocodeCache[getCleanAddress(address)]) {
-                        await delay(300); 
-                    }
-                    const coords = await geocodeAddress(address);
-                    if(coords) {
-                        waypoints.push({
-                            name: `任務 ${i+1}`,
-                            address: address,
-                            latlng: coords,
-                            type: 'task',
-                            time: task['檢查日期時間'].split(' ')[1] || '',
-                            unit: task['事業單位名稱']
-                        });
+                    if (lastTask && unitA === unitB && addrA === addrB) {
+                        // 重複的行程，跳過不處理
                     } else {
-                        missingAddresses.push(`${task['事業單位名稱']} (${address})`);
-                        waypoints.push({
-                            name: `任務 ${i+1} (未定位)`,
-                            address: address,
-                            latlng: null,
-                            type: 'task',
-                            time: task['檢查日期時間'].split(' ')[1] || '',
-                            unit: task['事業單位名稱']
-                        });
+                        mergedTasks.push(task);
+                    }
+                });
+
+                // UI 更新
+                document.getElementById('generateBtn').classList.add('hidden');
+                document.getElementById('loadingStatus').classList.remove('hidden');
+                document.getElementById('printDate').textContent = `日期：${dateSelect}`;
+                document.getElementById('totalDistance').classList.add('hidden');
+                document.getElementById('transportFee').classList.add('hidden');
+
+                let waypoints = [];
+                let missingAddresses = [];
+
+                // 1. 處理起點 (若沒輸入則自動跳過，不中斷程式)
+                if (startType !== 'none') {
+                    const startAddrStr = startType === 'home' ? homeAddr : assocAddr;
+                    const startName = startType === 'home' ? '家裡 (起點)' : '協會 (起點)';
+                    
+                    if(startAddrStr && startAddrStr.trim() !== '') {
+                        const coords = await geocodeAddress(startAddrStr);
+                        if(coords) {
+                            waypoints.push({ name: startName, address: startAddrStr, latlng: coords, type: 'start' });
+                        } else {
+                            alert(`無法解析起點地址：${startAddrStr}，本次路線將不包含起點。`);
+                        }
+                    } else {
+                        alert(`設定區尚未輸入${startName}地址，本次路線將不包含起點。`);
                     }
                 }
-            }
 
-            // 3. 處理終點
-            const endAddrStr = endType === 'home' ? homeAddr : assocAddr;
-            const endName = endType === 'home' ? '家裡 (終點)' : '協會 (終點)';
-            if(endAddrStr) {
-                const coords = await geocodeAddress(endAddrStr);
-                if(coords) {
-                    waypoints.push({ name: endName, address: endAddrStr, latlng: coords, type: 'end' });
+                // 2. 處理任務點
+                for (let i = 0; i < mergedTasks.length; i++) {
+                    const task = mergedTasks[i];
+                    const address = task['檢查地址'];
+                    
+                    if(address) {
+                        // 擷取時間 (用空白分割後的第二段)
+                        const timeParts = String(task['檢查日期時間'] || '').split(' ');
+                        const timeStr = timeParts.length > 1 ? timeParts[1] : '';
+
+                        const coords = await geocodeAddress(address);
+                        if(coords) {
+                            waypoints.push({
+                                name: `任務 ${i+1}`,
+                                address: String(address).trim(),
+                                latlng: coords,
+                                type: 'task',
+                                time: timeStr,
+                                unit: String(task['事業單位名稱'] || '').trim()
+                            });
+                        } else {
+                            missingAddresses.push(`${task['事業單位名稱']} (${address})`);
+                            waypoints.push({
+                                name: `任務 ${i+1} (未定位)`,
+                                address: String(address).trim(),
+                                latlng: null,
+                                type: 'task',
+                                time: timeStr,
+                                unit: String(task['事業單位名稱'] || '').trim()
+                            });
+                        }
+                    }
                 }
-            }
 
-            if(missingAddresses.length > 0) {
-                alert(`注意：以下地址格式無法解析定位，但仍會顯示在清單中：\n\n${missingAddresses.join('\n')}`);
-            }
+                // 3. 處理終點 (若沒輸入則自動跳過，不中斷程式)
+                if (endType !== 'none') {
+                    const endAddrStr = endType === 'home' ? homeAddr : assocAddr;
+                    const endName = endType === 'home' ? '家裡 (終點)' : '協會 (終點)';
+                    
+                    if(endAddrStr && endAddrStr.trim() !== '') {
+                        const coords = await geocodeAddress(endAddrStr);
+                        if(coords) {
+                            waypoints.push({ name: endName, address: endAddrStr, latlng: coords, type: 'end' });
+                        }
+                    }
+                }
 
-            // 繪製地圖與表格
-            drawMap(waypoints);
-            buildTable(waypoints);
-            resetUI();
+                if(missingAddresses.length > 0) {
+                    alert(`注意：以下地址無法在地圖上解析定位，但仍會顯示在表格中：\n\n${missingAddresses.join('\n')}`);
+                }
+
+                // 繪製地圖與表格
+                drawMap(waypoints);
+                buildTable(waypoints);
+                
+                // 強制重新計算地圖大小，避免破圖
+                setTimeout(() => { map.invalidateSize(); }, 300);
+
+            } catch (err) {
+                console.error("執行過程發生錯誤:", err);
+                alert("處理資料時發生錯誤，請確認檔案格式是否正確。");
+            } finally {
+                resetUI();
+            }
         }
 
         function resetUI() {
@@ -507,12 +572,12 @@
             validPoints.forEach((wp, index) => {
                 latlngs.push(wp.latlng);
                 
-                let iconColor = wp.type === 'task' ? 'blue' : (wp.type === 'start' ? '#10b981' : '#ef4444');
+                let iconColor = wp.type === 'task' ? '#3b82f6' : (wp.type === 'start' ? '#10b981' : '#ef4444');
                 let popupText = `<b>${wp.name}</b><br>${wp.address}`;
                 if(wp.unit) popupText += `<br>${wp.unit}`;
 
-                // 若剛好同地址重疊，使用 offset (簡單避開)
-                const offsetLatlng = [wp.latlng[0] + (Math.random()*0.0002 - 0.0001), wp.latlng[1] + (Math.random()*0.0002 - 0.0001)];
+                // 若剛好同地址重疊，稍微偏移避免完全蓋住
+                const offsetLatlng = [wp.latlng[0] + (Math.random()*0.0001), wp.latlng[1] + (Math.random()*0.0001)];
 
                 const markerHtml = `<div style="background-color:${iconColor}; width: 24px; height: 24px; border-radius: 50%; border: 2px solid white; color: white; text-align: center; line-height: 20px; font-weight: bold; box-shadow: 0 0 4px rgba(0,0,0,0.5); font-size: 12px;">${wp.type === 'task' ? index : (wp.type==='start'?'起':'終')}</div>`;
                 
@@ -556,9 +621,9 @@
                         distLabel.textContent = `預估總里程：${distanceKm} km`;
                         distLabel.classList.remove('hidden');
 
-                        // 計算交通費：總里程(公里)小數點無條件捨去後 乘 3.968，最後金額也無條件捨去
+                        // 計算交通費：總里程(公里)小數點無條件捨去後 乘 3.968
                         const flooredKm = Math.floor(route.distance / 1000);
-                        const fee = Math.floor(flooredKm * 3.968);
+                        const fee = Math.round(flooredKm * 3.968);
                         feeLabel.textContent = `交通費：${fee} 元`;
                         feeLabel.classList.remove('hidden');
 
@@ -583,11 +648,20 @@
             const tbody = document.getElementById('scheduleBody');
             tbody.innerHTML = '';
 
-            waypoints.forEach((wp, index) => {
+            // 計算真實的順序 (不計入起終點)
+            let taskIndex = 1;
+
+            waypoints.forEach((wp) => {
                 const tr = document.createElement('tr');
                 tr.className = wp.type !== 'task' ? 'bg-gray-50 font-bold' : '';
                 
-                let orderText = wp.type === 'start' ? '起點' : (wp.type === 'end' ? '終點' : index);
+                let orderText = '';
+                if(wp.type === 'start') orderText = '起點';
+                else if(wp.type === 'end') orderText = '終點';
+                else {
+                    orderText = taskIndex;
+                    taskIndex++;
+                }
                 
                 tr.innerHTML = `
                     <td class="p-2 border border-gray-300 text-center">${orderText}</td>
